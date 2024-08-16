@@ -100,6 +100,7 @@
     "@heroicons/react": "^2.0.18",
     "@launchdarkly/node-server-sdk": "^8.2.4",
     "@leeoniya/ufuzzy": "^0.7.0",
+    "@liveblocks/node": "^2.4.0",
     "@material-ui/core": "^4.12.4",
     "@material-ui/styles": "^4.11.5",
     "@mui/material": "^5.13.7",
