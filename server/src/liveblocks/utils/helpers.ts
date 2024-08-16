@@ -131,11 +131,6 @@ export const toCreateCommentData = (
 
   const { content, timestamp } = message;
 
-  logger.error('toCreateCommentData > userId', {
-    userId,
-    messageId: message.id,
-  });
-
   return {
     userId,
     createdAt: timestamp,
