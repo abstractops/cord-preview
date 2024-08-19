@@ -43,7 +43,8 @@
     "repl": "./build/index.mjs --mode=development --target=repl && node ./dist/repl/index.js",
     "generate-docs-embeddings": "./build/index.mjs --mode=development --target=scripts/docs-generate-search-data.ts && ./dist/scripts/docs-generate-search-data.js",
     "extract-demo-apps-to-sandpack-object": "./build/index.mjs --mode=development --target=scripts/extract-demo-apps-to-sandpack-file-object.ts && ./dist/scripts/extract-demo-apps-to-sandpack-file-object.js",
-    "prepare": "[ \"$(git config core.hooksPath)\" = \".githooks\" ] && git config --unset core.hooksPath ; ln -s ../../.githooks/prepare-commit-msg .git/hooks/ > /dev/null 2>&1 || true"
+    "prepare": "[ \"$(git config core.hooksPath)\" = \".githooks\" ] && git config --unset core.hooksPath ; ln -s ../../.githooks/prepare-commit-msg .git/hooks/ > /dev/null 2>&1 || true",
+    "db-dump": "cord curl project -- -o db-dump-$(date +%Y-%m-%d-%H-%M).sql https://api.cord.com/v1/customer/dbdump"
   },
   "jest": {
     "extensionsToTreatAsEsm": [
