@@ -10,10 +10,15 @@ import type {
   CordOrgMetadata,
   CordThreadMetadata,
   RoomWithThreads,
+  ThreadCommentMetadata,
+  ThreadCommentsMetadata,
 } from 'server/src/liveblocks/utils/index.ts';
 
 import {
   paginatedCallback,
+  parseThreadCommentsMetadata,
+  SYSTEM_USER_ID,
+  ThreadMetadataKeys,
   toCreateCommentData,
 } from 'server/src/liveblocks/utils/index.ts';
 
@@ -37,6 +42,8 @@ const logger = anonymousLogger();
 const liveblocks = new Liveblocks({
   secret: process.env.LIVEBLOCKS_KEY_SECRET ?? '',
 });
+
+export type CreateThreadParams = Parameters<typeof liveblocks.createThread>[0];
 
 const environment = process.env.LIVEBLOCKS_KEY_SECRET?.includes('sk_prod_')
   ? 'production'
@@ -63,21 +70,36 @@ const addReactionsToComment = async (
   cordMessage: CordData['messages'][number],
   comment: CommentData,
 ) => {
-  const reactions = await MessageReactionEntity.findAll({
-    where: {
-      messageID: cordMessage.id,
-    },
-  });
+  const reactions: MessageReactionEntity[] = [];
 
-  if (!reactions.length) {
+  try {
+    const result = await MessageReactionEntity.findAll({
+      where: {
+        messageID: cordMessage.id,
+      },
+    });
+    reactions.push(...result);
+  } catch (error) {
+    logger.error('>>> ERROR: Failed to get cord message reactions', {
+      cordMessageId: cordMessage.id,
+    });
+  }
+
+  const validReactions = reactions.filter((r) => Boolean(r.userID));
+  if (!validReactions.length) {
+    if (reactions.length) {
+      logger.error('>>> ERROR: No valid reactions found', {
+        cordMessageId: cordMessage.id,
+        reactionIds: reactions.map((r) => r.id),
+      });
+    }
     return;
   }
 
-  await Promise.all(
-    reactions
-      .filter((r) => Boolean(r.userID))
-      .map((reaction) => {
-        return liveblocks.addCommentReaction({
+  try {
+    const result = await Promise.all(
+      validReactions.map((reaction) =>
+        liveblocks.addCommentReaction({
           roomId: comment.roomId,
           threadId: comment.threadId,
           commentId: comment.id,
@@ -86,38 +108,106 @@ const addReactionsToComment = async (
             userId: reaction.userID,
             createdAt: reaction.timestamp,
           },
-        });
-      }),
+        }),
+      ),
+    );
+
+    logger.info('Added reactions to comment', {
+      cordMessageId: cordMessage.id,
+      commentId: comment.id,
+      count: result.length,
+    });
+  } catch (error) {
+    logger.error('>>> ERROR: Failed to add reactions to comment', {
+      cordMessageId: cordMessage.id,
+      commentId: comment.id,
+    });
+  }
+};
+
+/**
+ * Try to get existing thread comment based on the cord message id found in the thread metadata
+ * @param thread
+ * @param message
+ * @returns
+ */
+const getExistingThreadComment = async (
+  thread: ThreadData<CordThreadMetadata>,
+  message: MessageEntity,
+) => {
+  const pairs = parseThreadCommentsMetadata(
+    thread.metadata.messageToCommentPairs,
   );
 
-  logger.info('Added reactions to comment', {
-    cordMessageId: cordMessage.id,
-    count: reactions.length,
-  });
+  const existingPair = pairs.find((p) => p.cordMessageId === message.id);
+  if (!existingPair?.liveblocksCommentId) {
+    return null;
+  }
+
+  try {
+    // check the comment actually exists on liveblocks
+    return await liveblocks.getComment({
+      roomId: thread.roomId,
+      threadId: thread.id,
+      commentId: existingPair.liveblocksCommentId,
+    });
+  } catch (error) {
+    if (error instanceof LiveblocksError) {
+      logger.info('Liveblocks comment not found', {
+        cordMessageId: message.id,
+        commentId: existingPair.liveblocksCommentId,
+        status: error.status,
+        message: error.message,
+      });
+    } else {
+      logger.error('>>> ERROR: Failed to get existing thread comment', {
+        threadId: thread.id,
+        commentId: existingPair.liveblocksCommentId,
+      });
+    }
+  }
+  return null;
 };
 
 const createNewComment =
-  (thread: ThreadData, cordData: CordData) =>
-  async (message: MessageEntity) => {
+  (thread: ThreadData<CordThreadMetadata>, cordData: CordData) =>
+  async (message: MessageEntity): Promise<ThreadCommentMetadata | null> => {
     try {
-      logger.info('Creating new comment...', {
-        cordMessageId: message.id,
-        threadId: thread.id,
-      });
+      const existingComment = await getExistingThreadComment(thread, message);
+      if (existingComment) {
+        logger.info('Comment already exists', {
+          cordMessageId: message.id,
+          commentId: existingComment.id,
+        });
+
+        return {
+          liveblocksCommentId: existingComment.id,
+          cordMessageId: message.id,
+        };
+      }
+
+      const commentData = toCreateCommentData(message, cordData);
+      if (!commentData) {
+        logger.error('>>> ERROR: Failed to create comment data', {
+          cordMessageId: message.id,
+        });
+        return null;
+      }
 
       const comment = await liveblocks.createComment({
         roomId: thread.roomId,
         threadId: thread.id,
-        data: toCreateCommentData(message, cordData),
+        data: commentData,
       });
 
-      await addReactionsToComment(message, comment);
       logger.info('Created new comment', {
         cordMessageId: message.id,
         commentId: comment.id,
       });
 
-      return { commentId: comment.id };
+      await addReactionsToComment(message, comment);
+
+      return { liveblocksCommentId: comment.id, cordMessageId: message.id };
     } catch (error) {
       let status = 0;
       let errorMessage = 'Unknown error';
@@ -135,7 +225,7 @@ const createNewComment =
         message: errorMessage,
       });
 
-      return { commentId: null };
+      return null;
     }
   };
 
@@ -180,6 +270,64 @@ const getCordThreadMetadata = async (
   };
 };
 
+/**
+ * Add new comments metadata to existing thread
+ * @param thread
+ * @param commentsMetadata
+ */
+const addCommmetsMetadataToThread = async (
+  thread: ThreadData,
+  commentsMetadata: ThreadCommentsMetadata,
+) => {
+  try {
+    const existingValue =
+      thread.metadata?.[ThreadMetadataKeys.MESSAGE_TO_COMMENT_PAIRS];
+
+    const existingPairs = parseThreadCommentsMetadata(existingValue);
+
+    const commentsPairsMetadata: ThreadCommentsMetadata = [
+      ...existingPairs.filter(
+        (p) =>
+          !commentsMetadata.find((m) => m.cordMessageId === p.cordMessageId),
+      ),
+    ].concat(commentsMetadata);
+
+    const result = await liveblocks.editThreadMetadata({
+      roomId: thread.roomId,
+      threadId: thread.id,
+      data: {
+        userId: SYSTEM_USER_ID,
+        metadata: {
+          [ThreadMetadataKeys.MESSAGE_TO_COMMENT_PAIRS]: JSON.stringify(
+            commentsPairsMetadata,
+          ),
+        },
+        updatedAt: new Date(),
+      },
+    });
+
+    logger.info('Added comments metadata to thread', {
+      threadId: thread.id,
+      commentsMetadata,
+      result,
+    });
+  } catch (error) {
+    let status = 0;
+    let errorMessage = 'Unknown error';
+    if (error instanceof LiveblocksError) {
+      errorMessage = error.message;
+      status = error.status;
+    } else if (error instanceof Error) {
+      errorMessage = error.message;
+    }
+    logger.error('>>> ERROR: Failed to add comments metadata to thread', {
+      threadId: thread.id,
+      error: errorMessage,
+      status,
+    });
+  }
+};
+
 const createNewThreadWithComments =
   (cordData: CordData, room: RoomWithThreads) =>
   async (cordThread: ThreadEntity) => {
@@ -195,35 +343,62 @@ const createNewThreadWithComments =
           new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
       );
 
-    const [first, ...messages] = cordMessages;
+    const messagesCount = cordMessages.length;
 
-    logger.info('Cord messages count', {
-      count: cordMessages.length,
-    });
+    if (!messagesCount) {
+      logger.warn(`No messages found for thread ${cordThread.id}`);
+      return { cordThreadId: cordThread.id };
+    }
 
-    const metadata = await getCordThreadMetadata(cordThread);
+    let thread: ThreadData<CordThreadMetadata> | undefined;
+    const commentsMetadata: ThreadCommentsMetadata = [];
 
-    let thread: ThreadData | undefined;
-    try {
-      thread = await liveblocks.createThread({
-        roomId: room.id,
-        data: {
-          metadata,
-          comment: toCreateCommentData(first, cordData),
-        },
+    const [firstMessage, ...messages] = cordMessages;
+    const threadComment = toCreateCommentData(firstMessage, cordData);
+
+    if (!threadComment) {
+      logger.error('>>> ERROR: Failed to create thread comment', {
+        cordThreadId: cordThread.id,
+        cordMessageId: firstMessage.id,
+        cordMessageSourceId: firstMessage.sourceID,
       });
+    } else {
+      try {
+        thread = await liveblocks.createThread({
+          roomId: room.id,
+          data: {
+            metadata: await getCordThreadMetadata(cordThread),
+            comment: threadComment,
+          },
+        });
 
-      logger.info('Thread created', { threadId: thread.id });
-      LIVEBLOCKS_MIGRATION_STATS.comments++;
+        const [firstComment] = thread.comments;
+        commentsMetadata.push({
+          cordMessageId: firstMessage.id,
+          liveblocksCommentId: firstComment.id,
+        });
 
-      await addReactionsToComment(first, thread.comments[0]);
-    } catch (error) {
-      if (error instanceof LiveblocksError) {
-        if (error.status === 409) {
-          logger.error('>>> ERROR: Thread already exists', {
-            cordThreadId: cordThread.id,
-          });
-          // thread already exists
+        logger.info('Thread created', { threadId: thread.id });
+        await addReactionsToComment(firstMessage, firstComment);
+      } catch (error) {
+        if (error instanceof LiveblocksError) {
+          if (error.status === 409) {
+            // This should not happen, but if it does, reuse the thread data
+            logger.error('>>> ERROR: Thread already exists', {
+              cordThreadId: cordThread.id,
+            });
+            if (thread?.metadata?.cordThreadId !== cordThread.id) {
+              thread = room.threads.find(
+                (t) => t.metadata.cordThreadId === cordThread.id,
+              );
+              if (thread) {
+                logger.info('Reusing existing thread', {
+                  cordThreadId: cordThread.id,
+                  threadId: thread?.id,
+                });
+              }
+            }
+          }
         }
       }
     }
@@ -232,7 +407,7 @@ const createNewThreadWithComments =
       logger.error('>>> ERROR: Failed to create thread', {
         cordThreadId: cordThread.id,
       });
-      return { cordThreadId: cordThread.id, threadId: null };
+      return { cordThreadId: cordThread.id };
     }
 
     if (cordThread.resolvedTimestamp && cordThread.resolverUserID) {
@@ -252,21 +427,40 @@ const createNewThreadWithComments =
     const comments = await Promise.all(
       messages.map(createNewComment(thread, cordData)),
     );
-    LIVEBLOCKS_MIGRATION_STATS.comments += comments.filter((c) =>
+
+    const createdComments = comments.filter((c): c is NonNullable<typeof c> =>
       Boolean(c),
-    ).length;
+    );
+
+    commentsMetadata.push(...createdComments);
+    await addCommmetsMetadataToThread(thread, commentsMetadata);
+
+    const commentsCount = commentsMetadata.length;
+
+    LIVEBLOCKS_MIGRATION_STATS.comments += commentsCount;
 
     logger.info('Create new thread completed', {
       cordThreadId: cordThread.id,
       threadId: thread.id,
+      commentsCount: commentsCount,
     });
 
-    return { cordThreadId: cordThread.id, threadId: thread.id };
+    if (commentsCount !== messagesCount) {
+      const failedCount = messagesCount - commentsCount;
+      logger.info(`${failedCount} messages not pushed to Liveblocks`, {
+        cordThreadId: cordThread.id,
+        totalMessagesToCreate: messagesCount,
+      });
+    }
+
+    return {
+      cordThreadId: cordThread.id,
+      threadId: thread.id,
+      commentsMetadata,
+    };
   };
 
-const processRoom = (cordData: CordData) => async (room: RoomWithThreads) => {
-  logger.info('Processing room...', { roomId: room.id });
-
+const createNewThreads = async (cordData: CordData, room: RoomWithThreads) => {
   const newThreads = cordData.threads
     .filter(
       (thread) =>
@@ -278,12 +472,11 @@ const processRoom = (cordData: CordData) => async (room: RoomWithThreads) => {
         new Date(a.createdTimestamp).getTime(),
     );
 
-  logger.info('New threads count', {
-    count: newThreads.length,
-  });
+  let createdThreadsIds: string[] = [];
 
   if (newThreads.length) {
-    logger.info('Creating new threads...', {
+    const totalCount = newThreads.length;
+    logger.info(`Creating ${totalCount} new threads...`, {
       newThreadsIds: newThreads.map((t) => t.id),
     });
 
@@ -292,9 +485,29 @@ const processRoom = (cordData: CordData) => async (room: RoomWithThreads) => {
       newThreads.map(createNewThreadWithComments(cordData, room)),
     );
 
-    logger.info('New threads created', { result });
+    const createdThreads = result.filter(
+      (r): r is Required<typeof r> => !!r.threadId,
+    );
+    createdThreadsIds = createdThreads.map((t) => t.threadId);
+
+    const createdCount = createdThreads.length;
+
+    logger.info(`${createdCount} threads created`);
+    if (createdCount !== totalCount) {
+      const failedCount = totalCount - createdCount;
+      logger.info(`${failedCount} threads not pushed to Liveblocks`, {
+        totalThreadsToCreate: totalCount,
+      });
+    }
   }
 
+  return { newThreadsIds: newThreads.map((t) => t.id), createdThreadsIds };
+};
+
+const fixExistingThreadsMissingComments = async (
+  cordData: CordData,
+  room: RoomWithThreads,
+) => {
   logger.info('Check existing threads for missing comments...');
 
   // check existing threads for missing comments
@@ -323,28 +536,48 @@ const processRoom = (cordData: CordData) => async (room: RoomWithThreads) => {
       cordMessages.map(createNewComment(thread, cordData)),
     );
 
-    const createdCommentsIds = result
-      .filter((r): r is Required<typeof r> => Boolean(r))
-      .map((c) => c.commentId);
+    const createdComments = result.filter((r): r is NonNullable<typeof r> =>
+      Boolean(r),
+    );
 
-    let message = 'Missing comments added';
+    await addCommmetsMetadataToThread(thread, createdComments);
 
-    if (createdCommentsIds.length !== cordMessages.length) {
-      message += ' (some comments failed)';
+    const createdCount = createdComments.length;
+    if (!createdCount) {
+      continue;
     }
 
-    logger.info(message, {
-      threadId: thread.id,
-      cordThreadId: cordThread.id,
-      totalMessagesToCreate: cordMessages.length,
-      totalCommentsCreated: createdCommentsIds.length,
-    });
+    const toCreateCount = cordMessages.length;
+    logger.info(`${createdCount} comments added to thread ${thread.id}`);
+
+    if (createdCount !== toCreateCount) {
+      const failedCount = toCreateCount - createdCount;
+      logger.info(`${failedCount} messages not pushed to Liveblocks`, {
+        cordThreadId: cordThread.id,
+        totalMessagesToCreate: toCreateCount,
+      });
+    }
+
+    LIVEBLOCKS_MIGRATION_STATS.comments += createdCount;
   }
+};
 
-  LIVEBLOCKS_MIGRATION_STATS.threads += newThreads.length;
-  LIVEBLOCKS_MIGRATION_STATS.threads += room.threads.length;
+const processRoom = (cordData: CordData) => async (room: RoomWithThreads) => {
+  logger.info('Processing room...', { roomId: room.id });
 
-  logger.info('Room processed', { roomId: room.id });
+  const { newThreadsIds, createdThreadsIds } = await createNewThreads(
+    cordData,
+    room,
+  );
+
+  await fixExistingThreadsMissingComments(cordData, room);
+
+  LIVEBLOCKS_MIGRATION_STATS.threads +=
+    room.threads.length - newThreadsIds.length + createdThreadsIds.length;
+
+  logger.info(`Room processed`, { roomId: room.id });
+
+  return true;
 };
 
 async function getExistingLiveblocksData() {
@@ -380,7 +613,7 @@ async function createOrUpdateRooms(
     (org) => !existingRooms.some((room) => room.id === org.externalID),
   );
 
-  logger.info('Pushing new rooms...', {
+  logger.info(`Pushing ${newOrgs.length} new rooms...`, {
     orgsIds: newOrgs.map((o) => o.externalID),
   });
 
@@ -438,11 +671,13 @@ async function createOrUpdateRooms(
     }),
   );
 
-  const validRooms = rooms.filter((r): r is RoomWithThreads => !!r);
+  const createdRooms = rooms.filter((r): r is RoomWithThreads => !!r);
 
-  logger.info('Rooms pushed', { roomsIds: validRooms.map((r) => r.id) });
+  logger.info(`${createdRooms.length} Rooms pushed`, {
+    roomsIds: createdRooms.map((r) => r.id),
+  });
 
-  return validRooms;
+  return createdRooms;
 }
 
 async function pushDataToLiveblocks(
@@ -461,7 +696,7 @@ async function pushDataToLiveblocks(
         new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
     );
 
-  logger.info('Handling rooms...');
+  logger.info(`Handling ${rooms.length} rooms...`);
 
   // Process all rooms threaded comments to check and push any missing data
   await Promise.all(rooms.map(processRoom(cordData)));
@@ -487,6 +722,10 @@ async function getCordData() {
       platformApplicationID: {
         [Op.in]: applicationIds,
       },
+      externalID:
+        environment === 'staging'
+          ? '01F5E6Q1GV7K62F74JAFH6K3V9' // TODO: REMOVE TESTING EXTERNAL ID
+          : undefined,
     },
   });
 

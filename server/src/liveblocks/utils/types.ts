@@ -5,6 +5,7 @@ import type { NotificationEntity } from 'server/src/entity/notification/Notifica
 import type { OrgEntity } from 'server/src/entity/org/OrgEntity.ts';
 import type { ThreadEntity } from 'server/src/entity/thread/ThreadEntity.ts';
 import type { UserEntity } from 'server/src/entity/user/UserEntity.ts';
+import type { ThreadMetadataKeys } from 'server/src/liveblocks/utils/index.ts';
 
 export type CordData = {
   orgs: OrgEntity[];
@@ -28,6 +29,7 @@ export type CordThreadMetadata = {
    */
   cordMessagesIds?: string;
   cordUrl?: string;
+  [ThreadMetadataKeys.MESSAGE_TO_COMMENT_PAIRS]?: string;
 };
 
 export type RoomWithThreads = RoomData & {
@@ -39,4 +41,11 @@ export type CordOrgMetadata = {
   cordCreatedTimestamp?: string;
   cordState?: string;
   cordExternalId?: string;
+};
+
+export type ThreadCommentsMetadata = Array<ThreadCommentMetadata>;
+
+export type ThreadCommentMetadata = {
+  cordMessageId: string;
+  liveblocksCommentId: string;
 };

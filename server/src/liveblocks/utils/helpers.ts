@@ -2,13 +2,15 @@ import type {
   CommentBodyBlockElement,
   CommentBodyInlineElement,
 } from '@liveblocks/node';
-import type {
-  CordData,
-  CreateCommentData,
-} from 'server/src/liveblocks/utils/index.ts';
 import type { MessageNode } from '@cord-sdk/types';
 import { MessageNodeType } from '@cord-sdk/types';
 import type { MessageEntity } from 'server/src/entity/message/MessageEntity.ts';
+import type {
+  CordData,
+  CreateCommentData,
+  ThreadCommentMetadata,
+  ThreadCommentsMetadata,
+} from 'server/src/liveblocks/utils/index.ts';
 import { anonymousLogger } from 'server/src/logging/Logger.ts';
 
 const logger = anonymousLogger();
@@ -119,14 +121,14 @@ export const getExternalUserId = (
 export const toCreateCommentData = (
   message: MessageEntity,
   cordData: CordData,
-): CreateCommentData => {
+): CreateCommentData | null => {
   const userId = getExternalUserId(cordData, message.sourceID);
   if (!userId) {
-    logger.error('User not found', {
+    logger.error('>>> ERROR: User not found', {
       messageId: message.id,
       messageSourceId: message.sourceID,
     });
-    throw Error('User not found');
+    return null;
   }
 
   const { content, timestamp } = message;
@@ -139,4 +141,70 @@ export const toCreateCommentData = (
       content: content.map(toLiveblocksCommentContent(cordData)),
     },
   };
+};
+
+export const parseThreadCommentMetadata = (
+  value: unknown,
+): ThreadCommentMetadata | null => {
+  if (!value) {
+    return null;
+  }
+
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      return parseThreadCommentMetadata(parsed);
+    } catch (error) {
+      return null;
+    }
+  }
+
+  if (typeof value !== 'object') {
+    return null;
+  }
+
+  if (!('cordMessageId' in value) || !('liveblocksCommentId' in value)) {
+    return null;
+  }
+
+  return value as ThreadCommentMetadata;
+};
+
+/**
+ * Parse thread comments metadata from expected stringified JSON format
+ * @param value
+ * @returns
+ */
+export const parseThreadCommentsMetadata = (
+  value?: string | number | boolean | undefined,
+): ThreadCommentsMetadata => {
+  if (value === undefined || typeof value !== 'string') {
+    return [];
+  }
+
+  let parsed: unknown;
+  if (typeof value === 'string') {
+    try {
+      parsed = JSON.parse(value);
+    } catch (error) {
+      return [];
+    }
+  }
+
+  if (!Array.isArray(parsed)) {
+    return [];
+  }
+
+  const pairs: ThreadCommentsMetadata = [];
+
+  for (const item of parsed) {
+    const pair = parseThreadCommentMetadata(item);
+    if (!pair) {
+      continue;
+    }
+
+    pairs.push(pair);
+  }
+
+  return pairs;
 };
