@@ -320,13 +320,7 @@ const createNewThreadWithComments =
     const [firstMessage, ...messages] = cordMessages;
     const threadComment = toCreateCommentData(firstMessage, cordData);
 
-    if (!threadComment) {
-      logger.error('>>> ERROR: Failed to create thread comment', {
-        cordThreadId: cordThread.id,
-        cordMessageId: firstMessage.id,
-        cordMessageSourceId: firstMessage.sourceID,
-      });
-    } else {
+    if (threadComment) {
       try {
         thread = await liveblocks.createThread({
           roomId: room.id,
@@ -362,13 +356,24 @@ const createNewThreadWithComments =
                 });
               }
             }
+          } else {
+            logger.error('>>> LIVEBLOCKS ERROR: Failed to create thread', {
+              cordThreadId: cordThread.id,
+              status: error.status,
+              message: error.message,
+            });
           }
+        } else if (error instanceof Error) {
+          logger.error('>>> ERROR: Failed to create thread', {
+            cordThreadId: cordThread.id,
+            message: error.message,
+          });
         }
       }
     }
 
     if (!thread) {
-      logger.error('>>> ERROR: Failed to create thread', {
+      logger.error('>>> ERROR: No thread created', {
         cordThreadId: cordThread.id,
       });
       return { cordThreadId: cordThread.id };
@@ -443,10 +448,12 @@ const createNewThreadWithComments =
 
 const createNewThreads = async (cordData: CordData, room: RoomWithThreads) => {
   const sortedOrgThreads = cordData.threads
-    .filter(
-      (thread) =>
-        !room.threads.some((t) => t.metadata.cordThreadId === thread.id),
-    )
+    .filter((thread) => {
+      const existingRoomThread = room.threads.find(
+        (roomThread) => roomThread.metadata.cordThreadId === thread.id,
+      );
+      return !existingRoomThread;
+    })
     .sort(
       (a, b) =>
         new Date(b.createdTimestamp).getTime() -
@@ -827,6 +834,9 @@ async function getCordData() {
       orgID: {
         [Op.in]: orgs.map((org) => org.id),
       },
+      // ignore resolved threads
+      resolvedTimestamp: null,
+      resolverUserID: null,
     },
   });
 
