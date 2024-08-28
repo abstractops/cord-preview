@@ -2,16 +2,21 @@ import type {
   CommentBodyBlockElement,
   CommentBodyInlineElement,
 } from '@liveblocks/node';
-import type { MessageNode } from '@cord-sdk/types';
+import { v5 as uuid } from 'uuid';
+import type { Location, MessageNode } from '@cord-sdk/types';
 import { MessageNodeType } from '@cord-sdk/types';
 import type { MessageEntity } from 'server/src/entity/message/MessageEntity.ts';
+import { ROOM_ID_NAMESPACE } from 'server/src/liveblocks/utils/index.ts';
 import type {
   CordData,
+  CordThreadMetadata,
   CreateCommentData,
   ThreadCommentMetadata,
   ThreadCommentsMetadata,
 } from 'server/src/liveblocks/utils/index.ts';
 import { anonymousLogger } from 'server/src/logging/Logger.ts';
+import { PageEntity } from 'server/src/entity/page/PageEntity.ts';
+import type { ThreadEntity } from 'server/src/entity/thread/ThreadEntity.ts';
 
 const logger = anonymousLogger();
 
@@ -96,7 +101,7 @@ const toLiveblocksCommentContent =
 
 export const getExternalUserId = (
   cordData: CordData,
-  cordUserId: string,
+  cordUserId?: string | null,
 ): string | null => {
   if (!cordUserId) {
     return null;
@@ -208,3 +213,60 @@ export const parseThreadCommentsMetadata = (
 
   return pairs;
 };
+
+export const getCordThreadLocation = async (
+  cordThread: ThreadEntity,
+): Promise<Location> => {
+  let location: Location = {};
+  try {
+    const page = await PageEntity.findOne({
+      where: {
+        contextHash: cordThread.pageContextHash,
+        orgID: cordThread.orgID,
+      },
+    });
+
+    if (page?.contextData) {
+      location = page.contextData;
+    }
+  } catch (error) {
+    let errorMessage = 'Unknown error';
+    if (error instanceof Error) {
+      errorMessage = error.message;
+    }
+    logger.error('>>> ERROR: Failed to get cord thread location', {
+      cordThreadId: cordThread.id,
+      error: errorMessage,
+    });
+  }
+
+  return location;
+};
+
+export const getCordThreadMetadata = async (cordThread: ThreadEntity) => {
+  const location = await getCordThreadLocation(cordThread);
+
+  const cordMetadata: CordThreadMetadata = {
+    cordThreadId: cordThread.id,
+    cordOrgId: cordThread.orgID,
+    cordCreatedTimestamp: cordThread.createdTimestamp.toISOString(),
+  };
+
+  return {
+    ...cordMetadata,
+    ...location,
+  };
+};
+
+export const getRoomId = (location: Location): string => {
+  return uuid(JSON.stringify(location), ROOM_ID_NAMESPACE);
+};
+
+export async function toThreadData(t: ThreadEntity) {
+  const location = await getCordThreadLocation(t);
+  return {
+    threadId: t.id,
+    roomId: getRoomId(location),
+    location,
+  };
+}

@@ -7,19 +7,22 @@ import { Op } from 'sequelize';
 
 import type {
   CordData,
-  CordOrgMetadata,
   CordThreadMetadata,
+  getCordThreadLocation,
   RoomWithThreads,
   ThreadCommentMetadata,
   ThreadCommentsMetadata,
 } from 'server/src/liveblocks/utils/index.ts';
 
 import {
+  getCordThreadMetadata,
+  getExternalUserId,
   paginatedCallback,
   parseThreadCommentsMetadata,
   SYSTEM_USER_ID,
   ThreadMetadataKeys,
   toCreateCommentData,
+  toThreadData,
 } from 'server/src/liveblocks/utils/index.ts';
 
 import { OrgEntity } from 'server/src/entity/org/OrgEntity.ts';
@@ -34,7 +37,6 @@ import { UserEntity } from 'server/src/entity/user/UserEntity.ts';
 import { ApplicationEntity } from 'server/src/entity/application/ApplicationEntity.ts';
 import { EmailOutboundNotificationEntity } from 'server/src/entity/email_notification/EmailOutboundNotificationEntity.ts';
 import { NotificationEntity } from 'server/src/entity/notification/NotificationEntity.ts';
-import { PageEntity } from 'server/src/entity/page/PageEntity.ts';
 import { forwardHandlerExceptionsToNext } from 'server/src/public/routes/platform/util.ts';
 
 const logger = anonymousLogger();
@@ -44,16 +46,11 @@ const liveblocks = new Liveblocks({
 });
 
 export type CreateThreadParams = Parameters<typeof liveblocks.createThread>[0];
+export type CreateRoomParams = Parameters<typeof liveblocks.createRoom>[1];
 
 const environment = process.env.LIVEBLOCKS_KEY_SECRET?.includes('sk_prod_')
   ? 'production'
   : 'staging';
-
-const LIVEBLOCKS_MIGRATION_STATS = {
-  rooms: 0,
-  threads: 0,
-  comments: 0,
-};
 
 async function toRoomWithThreads(room: RoomData) {
   const threads = await liveblocks.getThreads({
@@ -67,7 +64,8 @@ async function toRoomWithThreads(room: RoomData) {
 }
 
 const addReactionsToComment = async (
-  cordMessage: CordData['messages'][number],
+  cordData: CordData,
+  cordMessageId: string,
   comment: CommentData,
 ) => {
   const reactions: MessageReactionEntity[] = [];
@@ -75,13 +73,13 @@ const addReactionsToComment = async (
   try {
     const result = await MessageReactionEntity.findAll({
       where: {
-        messageID: cordMessage.id,
+        messageID: cordMessageId,
       },
     });
     reactions.push(...result);
   } catch (error) {
     logger.error('>>> ERROR: Failed to get cord message reactions', {
-      cordMessageId: cordMessage.id,
+      cordMessageId: cordMessageId,
     });
   }
 
@@ -89,7 +87,7 @@ const addReactionsToComment = async (
   if (!validReactions.length) {
     if (reactions.length) {
       logger.error('>>> ERROR: No valid reactions found', {
-        cordMessageId: cordMessage.id,
+        cordMessageId: cordMessageId,
         reactionIds: reactions.map((r) => r.id),
       });
     }
@@ -98,28 +96,39 @@ const addReactionsToComment = async (
 
   try {
     const result = await Promise.all(
-      validReactions.map((reaction) =>
-        liveblocks.addCommentReaction({
-          roomId: comment.roomId,
-          threadId: comment.threadId,
-          commentId: comment.id,
-          data: {
-            emoji: reaction.unicodeReaction,
-            userId: reaction.userID,
-            createdAt: reaction.timestamp,
-          },
-        }),
-      ),
+      validReactions.map((reaction) => {
+        const userId = getExternalUserId(cordData, reaction.userID);
+        if (userId) {
+          return liveblocks.addCommentReaction({
+            roomId: comment.roomId,
+            threadId: comment.threadId,
+            commentId: comment.id,
+            data: {
+              emoji: reaction.unicodeReaction,
+              userId: userId,
+              createdAt: reaction.timestamp,
+            },
+          });
+        } else {
+          logger.error('>>> ERROR: Failed to get external user id', {
+            cordMessageId: cordMessageId,
+            cordReactionId: reaction.id,
+            cordUserId: reaction.userID,
+            userId: userId,
+          });
+          return null;
+        }
+      }),
     );
 
     logger.info('Added reactions to comment', {
-      cordMessageId: cordMessage.id,
+      cordMessageId: cordMessageId,
       commentId: comment.id,
       count: result.length,
     });
   } catch (error) {
     logger.error('>>> ERROR: Failed to add reactions to comment', {
-      cordMessageId: cordMessage.id,
+      cordMessageId: cordMessageId,
       commentId: comment.id,
     });
   }
@@ -153,7 +162,7 @@ const getExistingThreadComment = async (
     });
   } catch (error) {
     if (error instanceof LiveblocksError) {
-      logger.info('Liveblocks comment not found', {
+      logger.error('Liveblocks comment not found', {
         cordMessageId: message.id,
         commentId: existingPair.liveblocksCommentId,
         status: error.status,
@@ -205,7 +214,7 @@ const createNewComment =
         commentId: comment.id,
       });
 
-      await addReactionsToComment(message, comment);
+      await addReactionsToComment(cordData, message.id, comment);
 
       return { liveblocksCommentId: comment.id, cordMessageId: message.id };
     } catch (error) {
@@ -229,47 +238,6 @@ const createNewComment =
     }
   };
 
-const getCordThreadMetadata = async (
-  cordThread: ThreadEntity,
-): Promise<Record<string, string>> => {
-  let location = {};
-  try {
-    const page = await PageEntity.findOne({
-      where: {
-        contextHash: cordThread.pageContextHash,
-        orgID: cordThread.orgID,
-      },
-    });
-
-    if (page?.contextData) {
-      location = {
-        ...page.contextData,
-      };
-    }
-  } catch (error) {
-    let errorMessage = 'Unknown error';
-    if (error instanceof Error) {
-      errorMessage = error.message;
-    }
-    logger.error('>>> ERROR: Failed to get cord thread metadata', {
-      cordThreadId: cordThread.id,
-      error: errorMessage,
-    });
-    return location;
-  }
-
-  const cordMetadata: CordThreadMetadata = {
-    cordThreadId: cordThread.id,
-    cordOrgId: cordThread.orgID,
-    cordCreatedTimestamp: cordThread.createdTimestamp.toISOString(),
-  };
-
-  return {
-    ...cordMetadata,
-    ...location,
-  };
-};
-
 /**
  * Add new comments metadata to existing thread
  * @param thread
@@ -292,7 +260,7 @@ const addCommmetsMetadataToThread = async (
       ),
     ].concat(commentsMetadata);
 
-    const result = await liveblocks.editThreadMetadata({
+    return await liveblocks.editThreadMetadata({
       roomId: thread.roomId,
       threadId: thread.id,
       data: {
@@ -304,12 +272,6 @@ const addCommmetsMetadataToThread = async (
         },
         updatedAt: new Date(),
       },
-    });
-
-    logger.info('Added comments metadata to thread', {
-      threadId: thread.id,
-      commentsMetadata,
-      result,
     });
   } catch (error) {
     let status = 0;
@@ -325,6 +287,8 @@ const addCommmetsMetadataToThread = async (
       error: errorMessage,
       status,
     });
+
+    return;
   }
 };
 
@@ -379,7 +343,7 @@ const createNewThreadWithComments =
         });
 
         logger.info('Thread created', { threadId: thread.id });
-        await addReactionsToComment(firstMessage, firstComment);
+        await addReactionsToComment(cordData, firstMessage.id, firstComment);
       } catch (error) {
         if (error instanceof LiveblocksError) {
           if (error.status === 409) {
@@ -410,14 +374,33 @@ const createNewThreadWithComments =
       return { cordThreadId: cordThread.id };
     }
 
-    if (cordThread.resolvedTimestamp && cordThread.resolverUserID) {
-      await liveblocks.markThreadAsResolved({
-        roomId: room.id,
-        threadId: thread.id,
-        data: {
-          userId: cordThread.resolverUserID,
-        },
-      });
+    const resolverUserId = getExternalUserId(
+      cordData,
+      cordThread.resolverUserID,
+    );
+    if (cordThread.resolvedTimestamp && resolverUserId) {
+      try {
+        await liveblocks.markThreadAsResolved({
+          roomId: room.id,
+          threadId: thread.id,
+          data: {
+            userId: resolverUserId,
+          },
+        });
+        logger.info('Thread resolved', {
+          roomId: room.id,
+          threadId: thread.id,
+          resolverUserId,
+        });
+      } catch (error) {
+        if (error instanceof LiveblocksError) {
+          logger.error('markThreadAsResolved failed', {
+            resolverUserId,
+            status: error.status,
+            message: error.message,
+          });
+        }
+      }
       logger.info('Thread resolved', {
         threadId: thread.id,
         resolverUserId: cordThread.resolverUserID,
@@ -437,8 +420,6 @@ const createNewThreadWithComments =
 
     const commentsCount = commentsMetadata.length;
 
-    LIVEBLOCKS_MIGRATION_STATS.comments += commentsCount;
-
     logger.info('Create new thread completed', {
       cordThreadId: cordThread.id,
       threadId: thread.id,
@@ -447,7 +428,7 @@ const createNewThreadWithComments =
 
     if (commentsCount !== messagesCount) {
       const failedCount = messagesCount - commentsCount;
-      logger.info(`${failedCount} messages not pushed to Liveblocks`, {
+      logger.error(`${failedCount} messages not pushed to Liveblocks`, {
         cordThreadId: cordThread.id,
         totalMessagesToCreate: messagesCount,
       });
@@ -461,7 +442,7 @@ const createNewThreadWithComments =
   };
 
 const createNewThreads = async (cordData: CordData, room: RoomWithThreads) => {
-  const newThreads = cordData.threads
+  const sortedOrgThreads = cordData.threads
     .filter(
       (thread) =>
         !room.threads.some((t) => t.metadata.cordThreadId === thread.id),
@@ -472,22 +453,48 @@ const createNewThreads = async (cordData: CordData, room: RoomWithThreads) => {
         new Date(a.createdTimestamp).getTime(),
     );
 
+  const roomLocation = room.metadata;
+
+  const newThreads = sortedOrgThreads.filter(({ id }) => {
+    const threadLocation = cordData.threadsLocations.find(
+      (t) => t.threadId === id,
+    )?.location;
+
+    if (!threadLocation) {
+      return false;
+    }
+
+    const isSameLocation = Object.entries(roomLocation).every(
+      ([key, value]) => threadLocation[key] === value,
+    );
+
+    if (isSameLocation) {
+      logger.info(`Room ${room.id} thread found`, {
+        cordThreadId: id,
+        threadLocation: threadLocation.location,
+      });
+    }
+
+    return isSameLocation;
+  });
+
   let createdThreadsIds: string[] = [];
 
   if (newThreads.length) {
-    const totalCount = newThreads.length;
-    logger.info(`Creating ${totalCount} new threads...`, {
-      newThreadsIds: newThreads.map((t) => t.id),
-    });
-
     // create new threads
     const result = await Promise.all(
       newThreads.map(createNewThreadWithComments(cordData, room)),
     );
 
+    const totalCount = newThreads.length;
+    logger.info(`Creating ${totalCount} new threads...`, {
+      newThreadsIds: newThreads.map((t) => t.id),
+    });
+
     const createdThreads = result.filter(
       (r): r is Required<typeof r> => !!r.threadId,
     );
+
     createdThreadsIds = createdThreads.map((t) => t.threadId);
 
     const createdCount = createdThreads.length;
@@ -495,9 +502,12 @@ const createNewThreads = async (cordData: CordData, room: RoomWithThreads) => {
     logger.info(`${createdCount} threads created`);
     if (createdCount !== totalCount) {
       const failedCount = totalCount - createdCount;
-      logger.info(`${failedCount} threads not pushed to Liveblocks`, {
-        totalThreadsToCreate: totalCount,
-      });
+      logger.error(
+        `ERROR >>> ${failedCount} threads not pushed to Liveblocks`,
+        {
+          totalThreadsToCreate: totalCount,
+        },
+      );
     }
   }
 
@@ -552,28 +562,20 @@ const fixExistingThreadsMissingComments = async (
 
     if (createdCount !== toCreateCount) {
       const failedCount = toCreateCount - createdCount;
-      logger.info(`${failedCount} messages not pushed to Liveblocks`, {
+      logger.error(`ERROR > ${failedCount} messages not pushed to Liveblocks`, {
         cordThreadId: cordThread.id,
         totalMessagesToCreate: toCreateCount,
       });
     }
-
-    LIVEBLOCKS_MIGRATION_STATS.comments += createdCount;
   }
 };
 
 const processRoom = (cordData: CordData) => async (room: RoomWithThreads) => {
   logger.info('Processing room...', { roomId: room.id });
 
-  const { newThreadsIds, createdThreadsIds } = await createNewThreads(
-    cordData,
-    room,
-  );
+  await createNewThreads(cordData, room);
 
   await fixExistingThreadsMissingComments(cordData, room);
-
-  LIVEBLOCKS_MIGRATION_STATS.threads +=
-    room.threads.length - newThreadsIds.length + createdThreadsIds.length;
 
   logger.info(`Room processed`, { roomId: room.id });
 
@@ -606,25 +608,47 @@ async function getExistingLiveblocksData() {
 }
 
 async function createOrUpdateRooms(
-  existingRooms: RoomData[],
   cordData: CordData,
+  existingRooms: RoomData[],
 ) {
-  const newOrgs = cordData.orgs.filter(
-    (org) => !existingRooms.some((room) => room.id === org.externalID),
-  );
+  const roomsMap = new Map<
+    string,
+    {
+      location: Awaited<ReturnType<typeof getCordThreadLocation>>;
+      threadIds: (typeof cordData)['threads'][number]['id'][];
+    }
+  >();
 
-  logger.info(`Pushing ${newOrgs.length} new rooms...`, {
-    orgsIds: newOrgs.map((o) => o.externalID),
+  cordData.threadsLocations.forEach(({ threadId, roomId, location }) => {
+    if (!roomsMap.has(roomId)) {
+      roomsMap.set(roomId, {
+        location,
+        threadIds: [threadId],
+      });
+    }
+
+    const room = roomsMap.get(roomId);
+    if (room) {
+      room.threadIds.push(threadId);
+    }
+  });
+
+  const roomsToCreate = Array.from(roomsMap);
+
+  logger.info(`Pushing ${roomsToCreate.length} new rooms...`, {
+    roomIds: roomsToCreate.map(([roomId]) => roomId),
   });
 
   const rooms = await Promise.all(
-    newOrgs.map(async (org) => {
-      const orgMetadata: CordOrgMetadata = {
-        cordCreatedTimestamp: org.createdTimestamp.toISOString(),
-        cordOrgId: org.id,
-        cordExternalId: org.externalID,
-        cordState: org.state,
-      };
+    roomsToCreate.map(async ([roomId, { location, threadIds }]) => {
+      const threads =
+        cordData.threads.filter((t) => threadIds.includes(t.id)) ?? [];
+      const [orgId] = threads.map((t) => t.orgID).filter(Boolean) ?? [];
+      const org = cordData.orgs.find((o) => o.id === orgId);
+      if (!org?.externalID) {
+        logger.error('Not externalID found', { roomId, threadIds, orgId });
+        return null;
+      }
 
       const roomParams: Parameters<typeof liveblocks.createRoom>[1] = {
         defaultAccesses: [],
@@ -633,11 +657,24 @@ async function createOrUpdateRooms(
           [`client_${org.externalID}`]: ['room:write'],
           internal: ['room:write'],
         },
-        metadata: orgMetadata,
+        metadata: Object.entries(location).reduce<CreateRoomParams['metadata']>(
+          (metadata, entry) => {
+            if (!metadata) {
+              metadata = {};
+            }
+
+            const [key, value] = entry;
+            metadata[key] = value.toString();
+
+            return metadata;
+          },
+          {},
+        ),
       };
 
-      const existingRoom = existingRooms.find((r) => r.id === org.externalID);
+      const existingRoom = existingRooms.find((r) => r.id === roomId);
       if (existingRoom) {
+        logger.info('Updating existing room...', { roomId });
         const updatedRoom = await liveblocks.updateRoom(
           org.externalID,
           roomParams,
@@ -646,7 +683,8 @@ async function createOrUpdateRooms(
       }
 
       try {
-        const newRoom = await liveblocks.createRoom(org.externalID, roomParams);
+        logger.info('Creating new room...', { roomId });
+        const newRoom = await liveblocks.createRoom(roomId, roomParams);
         if (!newRoom) {
           throw new Error('Failed to create room');
         }
@@ -655,6 +693,14 @@ async function createOrUpdateRooms(
       } catch (e) {
         let message = 'Failed to create room';
         if (e instanceof LiveblocksError) {
+          if (e.status === 409) {
+            // room already exists, should update
+            const updatedRoom = await liveblocks.updateRoom(
+              org.externalID,
+              roomParams,
+            );
+            return await toRoomWithThreads(updatedRoom);
+          }
           message = e.message;
         } else if (e instanceof Error) {
           message = e.message;
@@ -687,10 +733,12 @@ async function pushDataToLiveblocks(
   logger.info('Pushing data to Liveblocks...');
 
   // Add missing rooms to liveblocks
-  const newRooms = await createOrUpdateRooms(existingRooms, cordData);
+  const newRooms = await createOrUpdateRooms(cordData, existingRooms);
 
   const rooms = [...existingRooms, ...newRooms]
-    .filter((room) => cordData.orgs.find((org) => org.externalID === room.id))
+    // .filter((room) =>
+    //   cordData.orgs.find((org) => org.externalID === room.metadata.clientId),
+    // )
     .sort(
       (a, b) =>
         new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
@@ -701,7 +749,6 @@ async function pushDataToLiveblocks(
   // Process all rooms threaded comments to check and push any missing data
   await Promise.all(rooms.map(processRoom(cordData)));
 
-  LIVEBLOCKS_MIGRATION_STATS.rooms = rooms.length;
   logger.info('Rooms handled');
 }
 
@@ -716,22 +763,25 @@ async function getCordData() {
 
   const applicationIds = applications.map((app) => app.id);
 
+  /**
+   * TODO: remove this after final tests are done
+   */
+  const orgExternalId =
+    environment === 'staging'
+      ? '01F5E6Q1GV7K62F74JAFH6K3V9' // Example Co
+      : '01F5E6Q1GV728ZN73AS4Y5EVW5'; // Abstractops
+
   const allOrgs = await OrgEntity.findAll({
     where: {
       state: 'active',
       platformApplicationID: {
         [Op.in]: applicationIds,
       },
-      externalID:
-        environment === 'staging'
-          ? '01F5E6Q1GV7K62F74JAFH6K3V9' // TODO: REMOVE TESTING EXTERNAL ID
-          : undefined,
+      externalID: orgExternalId,
     },
   });
 
-  const orgs = allOrgs.filter(
-    (o) => o.externalID === '01F5E6Q1GV7K62F74JAFH6K3V9',
-  );
+  const orgs = allOrgs.filter((o) => o.externalID === orgExternalId);
 
   const orgIds = orgs.map((org) => org.id);
 
@@ -751,6 +801,19 @@ async function getCordData() {
     },
   });
 
+  const usersWithOrg = users.map((u) => {
+    const userOrgMembers = orgMembers.filter((m) => m.userID === u.id);
+    const userOrgs = orgs.filter((o) =>
+      userOrgMembers.find((om) => om.orgID === o.id),
+    );
+
+    if (!userOrgs?.length) {
+      throw Error(`Org not found for user ${u.id}`);
+    }
+
+    return u;
+  });
+
   const notifications = await NotificationEntity.findAll({
     where: {
       platformApplicationID: {
@@ -766,6 +829,8 @@ async function getCordData() {
       },
     },
   });
+
+  const threadsLocations = await Promise.all(threads.map(toThreadData));
 
   const messages = await MessageEntity.findAll({
     where: {
@@ -793,8 +858,9 @@ async function getCordData() {
 
   return {
     orgs,
-    users,
+    users: usersWithOrg,
     threads,
+    threadsLocations,
     messages,
     emailNotifications,
     notifications,
@@ -808,30 +874,32 @@ async function LiveblocksMigrationHandler(req: Request, res: Response) {
     const cordData = await getCordData();
 
     // Get existing data from liveblocks
-    const existingRooms = await getExistingLiveblocksData();
+    let existingRooms = await getExistingLiveblocksData();
+
+    // TODO: remove delete rooms logic after final tests are done
+    logger.info(`Deleting ${existingRooms.length} existing rooms...`);
+    const deletedRoomsIds = await Promise.all(
+      existingRooms.map(async (room) => {
+        try {
+          await liveblocks.deleteRoom(room.id);
+          return room.id;
+        } catch (error) {
+          if (error instanceof LiveblocksError) {
+            logger.error(`>>> ERROR: Failed to delete room ${room.id}`, {
+              error: error.message,
+              status: error.status,
+            });
+          }
+          return null;
+        }
+      }),
+    );
+
+    existingRooms = existingRooms.filter(
+      (room) => !deletedRoomsIds.includes(room.id),
+    );
 
     await pushDataToLiveblocks(cordData, existingRooms);
-
-    if (cordData.orgs.length !== LIVEBLOCKS_MIGRATION_STATS.rooms) {
-      logger.info('Failed to migrate all rooms', {
-        cordOrgs: cordData.orgs.length,
-        rooms: LIVEBLOCKS_MIGRATION_STATS.rooms,
-      });
-    }
-
-    if (cordData.threads.length !== LIVEBLOCKS_MIGRATION_STATS.threads) {
-      logger.info('Failed to migrate all threads', {
-        cordThreads: cordData.threads.length,
-        threads: LIVEBLOCKS_MIGRATION_STATS.threads,
-      });
-    }
-
-    if (cordData.messages.length !== LIVEBLOCKS_MIGRATION_STATS.comments) {
-      logger.info('Failed to migrate all comments', {
-        cordMessages: cordData.messages.length,
-        comments: LIVEBLOCKS_MIGRATION_STATS.comments,
-      });
-    }
 
     logger.info('Migration completed');
 
@@ -845,7 +913,6 @@ async function LiveblocksMigrationHandler(req: Request, res: Response) {
         messages: cordData.messages.length,
         emailNotifications: cordData.emailNotifications.length,
       },
-      liveblocksStats: LIVEBLOCKS_MIGRATION_STATS,
     });
   } catch (error) {
     let type: 'Error' | 'LiveblocksError' | 'Unknown' = 'Unknown';

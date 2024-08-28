@@ -6,11 +6,17 @@ import type { OrgEntity } from 'server/src/entity/org/OrgEntity.ts';
 import type { ThreadEntity } from 'server/src/entity/thread/ThreadEntity.ts';
 import type { UserEntity } from 'server/src/entity/user/UserEntity.ts';
 import type { ThreadMetadataKeys } from 'server/src/liveblocks/utils/index.ts';
+import type { Location } from 'common/types/index.ts';
 
 export type CordData = {
   orgs: OrgEntity[];
   users: UserEntity[];
   threads: ThreadEntity[];
+  threadsLocations: {
+    threadId: string;
+    roomId: string;
+    location: Location;
+  }[];
   messages: MessageEntity[];
   emailNotifications: EmailOutboundNotificationEntity[];
   notifications: NotificationEntity[];
