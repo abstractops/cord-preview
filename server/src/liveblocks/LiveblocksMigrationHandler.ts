@@ -64,8 +64,7 @@ async function toRoomWithThreads(room: RoomData) {
     } satisfies RoomWithThreads;
   } catch (error) {
     if (error instanceof LiveblocksError) {
-      logger.error('>>> ERROR: Failed to get room threads', {
-        roomId: room.id,
+      logger.error(`>>> ERROR: Failed to get room ${room.id} threads`, {
         status: error.status,
         message: error.message,
       });
@@ -73,7 +72,7 @@ async function toRoomWithThreads(room: RoomData) {
     return {
       ...room,
       threads: [],
-    };
+    } satisfies RoomWithThreads;
   }
 }
 
@@ -593,6 +592,7 @@ const fixExistingThreadsMissingComments = async (
 };
 
 const processRoom = (cordData: CordData) => async (room: RoomWithThreads) => {
+  logger.info(`Processing room ${room.id}...`);
   const { newThreadsIds, createdThreadsIds } = await createNewThreads(
     cordData,
     room,
@@ -623,11 +623,12 @@ async function getExistingLiveblocksData() {
 
       rooms.push(...existingRooms.data);
 
-      logger.info('Fetched existing rooms', {
-        count: existingRooms.data.length,
-        page,
-        nextCursor: existingRooms.nextCursor,
-      });
+      logger.info(
+        `Fetched ${existingRooms.data.length} existing rooms from page ${page}`,
+        {
+          nextCursor: existingRooms.nextCursor,
+        },
+      );
 
       return {
         nextCursor: existingRooms.nextCursor,
@@ -649,9 +650,7 @@ async function getExistingLiveblocksData() {
 
   const existingRooms = await Promise.all(rooms.map(toRoomWithThreads));
 
-  logger.info('Fetched existing rooms', {
-    count: existingRooms.length,
-  });
+  logger.info(`Fetched a total of ${existingRooms.length} existing rooms`);
 
   return existingRooms;
 }
@@ -684,9 +683,7 @@ async function createOrUpdateRooms(
 
   const roomsToCreate = Array.from(roomsMap);
 
-  logger.info(`Pushing ${roomsToCreate.length} new rooms...`, {
-    roomIds: roomsToCreate.map(([roomId]) => roomId),
-  });
+  logger.info(`Pushing ${roomsToCreate.length} new rooms...`);
 
   const rooms = await Promise.all(
     roomsToCreate.map(async ([roomId, { location, threadIds }]) => {
@@ -724,9 +721,10 @@ async function createOrUpdateRooms(
       const existingRoom = existingRooms.find((r) => r.id === roomId);
       if (existingRoom) {
         const updatedRoom = await liveblocks.updateRoom(
-          org.externalID,
+          existingRoom.id,
           roomParams,
         );
+
         const room = await toRoomWithThreads(updatedRoom);
         logger.info(`Updated existing room ${room.id}`);
         return room;
