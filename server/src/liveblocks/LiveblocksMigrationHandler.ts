@@ -485,37 +485,37 @@ const createNewThreads = async (cordData: CordData, room: RoomWithThreads) => {
     return isSameLocation;
   });
 
+  if (!newThreads.length) {
+    logger.info('No new threads to create');
+    return { newThreadsIds: [], createdThreadsIds: [] };
+  }
+
   let createdThreadsIds: string[] = [];
 
-  if (newThreads.length) {
-    // create new threads
-    const result = await Promise.all(
-      newThreads.map(createNewThreadWithComments(cordData, room)),
-    );
+  // create new threads
+  const result = await Promise.all(
+    newThreads.map(createNewThreadWithComments(cordData, room)),
+  );
 
-    const totalCount = newThreads.length;
-    logger.info(`Creating ${totalCount} new threads...`, {
-      newThreadsIds: newThreads.map((t) => t.id),
+  const totalCount = newThreads.length;
+  logger.info(`Creating ${totalCount} new threads...`, {
+    newThreadsIds: newThreads.map((t) => t.id),
+  });
+
+  const createdThreads = result.filter(
+    (r): r is Required<typeof r> => !!r.threadId,
+  );
+
+  createdThreadsIds = createdThreads.map((t) => t.threadId);
+
+  const createdCount = createdThreads.length;
+
+  logger.info(`${createdCount} threads created`);
+  if (createdCount !== totalCount) {
+    const failedCount = totalCount - createdCount;
+    logger.error(`ERROR >>> ${failedCount} threads not pushed to Liveblocks`, {
+      totalThreadsToCreate: totalCount,
     });
-
-    const createdThreads = result.filter(
-      (r): r is Required<typeof r> => !!r.threadId,
-    );
-
-    createdThreadsIds = createdThreads.map((t) => t.threadId);
-
-    const createdCount = createdThreads.length;
-
-    logger.info(`${createdCount} threads created`);
-    if (createdCount !== totalCount) {
-      const failedCount = totalCount - createdCount;
-      logger.error(
-        `ERROR >>> ${failedCount} threads not pushed to Liveblocks`,
-        {
-          totalThreadsToCreate: totalCount,
-        },
-      );
-    }
   }
 
   return { newThreadsIds: newThreads.map((t) => t.id), createdThreadsIds };
