@@ -116,11 +116,7 @@ export const getExternalUserId = (
     user = cordData.users.find((u) => u.id === emailNotification?.userID);
   }
 
-  if (!user) {
-    return null;
-  }
-
-  return user.externalID;
+  return user?.externalID ?? user?.id ?? cordUserId;
 };
 
 export const toCreateCommentData = (
