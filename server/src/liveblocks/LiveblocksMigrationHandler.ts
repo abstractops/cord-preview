@@ -53,14 +53,28 @@ const environment = process.env.LIVEBLOCKS_KEY_SECRET?.includes('sk_prod_')
   : 'staging';
 
 async function toRoomWithThreads(room: RoomData) {
-  const threads = await liveblocks.getThreads({
-    roomId: room.id,
-  });
+  try {
+    const threads = await liveblocks.getThreads({
+      roomId: room.id,
+    });
 
-  return {
-    ...room,
-    threads: threads.data,
-  } satisfies RoomWithThreads;
+    return {
+      ...room,
+      threads: threads.data,
+    } satisfies RoomWithThreads;
+  } catch (error) {
+    if (error instanceof LiveblocksError) {
+      logger.error('>>> ERROR: Failed to get room threads', {
+        roomId: room.id,
+        status: error.status,
+        message: error.message,
+      });
+    }
+    return {
+      ...room,
+      threads: [],
+    };
+  }
 }
 
 const addReactionsToComment = async (
@@ -513,7 +527,7 @@ const createNewThreads = async (cordData: CordData, room: RoomWithThreads) => {
   logger.info(`${createdCount} threads created`);
   if (createdCount !== totalCount) {
     const failedCount = totalCount - createdCount;
-    logger.error(`ERROR >>> ${failedCount} threads not pushed to Liveblocks`, {
+    logger.error(`>>> ERROR: ${failedCount} threads not pushed to Liveblocks`, {
       totalThreadsToCreate: totalCount,
     });
   }
@@ -525,8 +539,6 @@ const fixExistingThreadsMissingComments = async (
   cordData: CordData,
   room: RoomWithThreads,
 ) => {
-  logger.info('Check existing threads for missing comments...');
-
   // check existing threads for missing comments
   for (const thread of room.threads) {
     if (!thread.metadata.cordThreadId) {
@@ -569,22 +581,32 @@ const fixExistingThreadsMissingComments = async (
 
     if (createdCount !== toCreateCount) {
       const failedCount = toCreateCount - createdCount;
-      logger.error(`ERROR > ${failedCount} messages not pushed to Liveblocks`, {
-        cordThreadId: cordThread.id,
-        totalMessagesToCreate: toCreateCount,
-      });
+      logger.error(
+        `>>> ERROR: ${failedCount} messages not pushed to Liveblocks`,
+        {
+          cordThreadId: cordThread.id,
+          totalMessagesToCreate: toCreateCount,
+        },
+      );
     }
   }
 };
 
 const processRoom = (cordData: CordData) => async (room: RoomWithThreads) => {
-  logger.info('Processing room...', { roomId: room.id });
+  const { newThreadsIds, createdThreadsIds } = await createNewThreads(
+    cordData,
+    room,
+  );
 
-  await createNewThreads(cordData, room);
+  logger.info(
+    `Created ${newThreadsIds?.length ?? 0}/${
+      createdThreadsIds?.length ?? 0
+    } new threads for room ${room.id}`,
+  );
 
   await fixExistingThreadsMissingComments(cordData, room);
 
-  logger.info(`Room processed`, { roomId: room.id });
+  logger.info(`Room ${room.id} processed`, { roomId: room.id });
 
   return true;
 };
@@ -594,15 +616,35 @@ async function getExistingLiveblocksData() {
 
   logger.info('Fetching existing rooms...');
   await paginatedCallback(async ({ nextCursor, page }) => {
-    const existingRooms = await liveblocks.getRooms({
-      startingAfter: page === 0 ? undefined : nextCursor ?? undefined,
-    });
+    try {
+      const existingRooms = await liveblocks.getRooms({
+        startingAfter: page === 0 ? undefined : nextCursor ?? undefined,
+      });
 
-    rooms.push(...existingRooms.data);
+      rooms.push(...existingRooms.data);
 
-    return {
-      nextCursor: existingRooms.nextCursor,
-    };
+      logger.info('Fetched existing rooms', {
+        count: existingRooms.data.length,
+        page,
+        nextCursor: existingRooms.nextCursor,
+      });
+
+      return {
+        nextCursor: existingRooms.nextCursor,
+      };
+    } catch (error) {
+      if (error instanceof LiveblocksError) {
+        logger.error('>>> LIVEBLOCKS ERROR: Failed to get existing rooms', {
+          page,
+          nextCursor,
+          error: error.message,
+          status: error.status,
+        });
+      }
+      return {
+        nextCursor: null,
+      };
+    }
   });
 
   const existingRooms = await Promise.all(rooms.map(toRoomWithThreads));
@@ -681,22 +723,24 @@ async function createOrUpdateRooms(
 
       const existingRoom = existingRooms.find((r) => r.id === roomId);
       if (existingRoom) {
-        logger.info('Updating existing room...', { roomId });
         const updatedRoom = await liveblocks.updateRoom(
           org.externalID,
           roomParams,
         );
-        return await toRoomWithThreads(updatedRoom);
+        const room = await toRoomWithThreads(updatedRoom);
+        logger.info(`Updated existing room ${room.id}`);
+        return room;
       }
 
       try {
-        logger.info('Creating new room...', { roomId });
         const newRoom = await liveblocks.createRoom(roomId, roomParams);
         if (!newRoom) {
           throw new Error('Failed to create room');
         }
 
-        return await toRoomWithThreads(newRoom);
+        const room = await toRoomWithThreads(newRoom);
+        logger.info(`Created new room ${room.id}`);
+        return room;
       } catch (e) {
         let message = 'Failed to create room';
         if (e instanceof LiveblocksError) {
@@ -737,8 +781,6 @@ async function pushDataToLiveblocks(
   cordData: CordData,
   existingRooms: RoomWithThreads[],
 ) {
-  logger.info('Pushing data to Liveblocks...');
-
   // Add missing rooms to liveblocks
   const newRooms = await createOrUpdateRooms(cordData, existingRooms);
 
@@ -751,12 +793,8 @@ async function pushDataToLiveblocks(
         new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
     );
 
-  logger.info(`Handling ${rooms.length} rooms...`);
-
   // Process all rooms threaded comments to check and push any missing data
   await Promise.all(rooms.map(processRoom(cordData)));
-
-  logger.info('Rooms handled');
 }
 
 async function getCordData() {
@@ -773,22 +811,20 @@ async function getCordData() {
   /**
    * TODO: remove this after final tests are done
    */
-  const orgExternalId =
-    environment === 'staging'
-      ? '01F5E6Q1GV7K62F74JAFH6K3V9' // Example Co
-      : '01F5E6Q1GV728ZN73AS4Y5EVW5'; // Abstractops
+  // const orgExternalId =
+  //   environment === 'staging'
+  //     ? '01F5E6Q1GV7K62F74JAFH6K3V9' // Example Co
+  //     : '01F5E6Q1GV728ZN73AS4Y5EVW5'; // Abstractops
 
-  const allOrgs = await OrgEntity.findAll({
+  const orgs = await OrgEntity.findAll({
     where: {
       state: 'active',
       platformApplicationID: {
         [Op.in]: applicationIds,
       },
-      externalID: orgExternalId,
+      // externalID: orgExternalId,
     },
   });
-
-  const orgs = allOrgs.filter((o) => o.externalID === orgExternalId);
 
   const orgIds = orgs.map((org) => org.id);
 
@@ -884,30 +920,30 @@ async function LiveblocksMigrationHandler(req: Request, res: Response) {
     const cordData = await getCordData();
 
     // Get existing data from liveblocks
-    let existingRooms = await getExistingLiveblocksData();
+    const existingRooms = await getExistingLiveblocksData();
 
     // TODO: remove delete rooms logic after final tests are done
-    logger.info(`Deleting ${existingRooms.length} existing rooms...`);
-    const deletedRoomsIds = await Promise.all(
-      existingRooms.map(async (room) => {
-        try {
-          await liveblocks.deleteRoom(room.id);
-          return room.id;
-        } catch (error) {
-          if (error instanceof LiveblocksError) {
-            logger.error(`>>> ERROR: Failed to delete room ${room.id}`, {
-              error: error.message,
-              status: error.status,
-            });
-          }
-          return null;
-        }
-      }),
-    );
+    // logger.info(`Deleting ${existingRooms.length} existing rooms...`);
+    // const deletedRoomsIds = await Promise.all(
+    //   existingRooms.map(async (room) => {
+    //     try {
+    //       await liveblocks.deleteRoom(room.id);
+    //       return room.id;
+    //     } catch (error) {
+    //       if (error instanceof LiveblocksError) {
+    //         logger.error(`>>> ERROR: Failed to delete room ${room.id}`, {
+    //           error: error.message,
+    //           status: error.status,
+    //         });
+    //       }
+    //       return null;
+    //     }
+    //   }),
+    // );
 
-    existingRooms = existingRooms.filter(
-      (room) => !deletedRoomsIds.includes(room.id),
-    );
+    // existingRooms = existingRooms.filter(
+    //   (room) => !deletedRoomsIds.includes(room.id),
+    // );
 
     await pushDataToLiveblocks(cordData, existingRooms);
 
