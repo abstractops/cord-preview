@@ -336,10 +336,11 @@ const createNewThreadWithComments =
 
     if (threadComment) {
       try {
+        const threadMetadata = await getCordThreadMetadata(cordThread);
         thread = await liveblocks.createThread({
           roomId: room.id,
           data: {
-            metadata: await getCordThreadMetadata(cordThread),
+            metadata: threadMetadata,
             comment: threadComment,
           },
         });
