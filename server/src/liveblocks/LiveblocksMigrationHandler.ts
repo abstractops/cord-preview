@@ -13,6 +13,7 @@ import type {
   ThreadCommentMetadata,
   ThreadCommentsMetadata,
 } from 'server/src/liveblocks/utils/index.ts';
+import type { Location } from 'common/types/index.ts';
 
 import {
   getCordThreadMetadata,
@@ -620,16 +621,7 @@ async function getExistingLiveblocksData() {
       const existingRooms = await liveblocks.getRooms({
         startingAfter: page === 0 ? undefined : nextCursor ?? undefined,
       });
-
       rooms.push(...existingRooms.data);
-
-      logger.info(
-        `Fetched ${existingRooms.data.length} existing rooms from page ${page}`,
-        {
-          nextCursor: existingRooms.nextCursor,
-        },
-      );
-
       return {
         nextCursor: existingRooms.nextCursor,
       };
@@ -655,10 +647,97 @@ async function getExistingLiveblocksData() {
   return existingRooms;
 }
 
-async function createOrUpdateRooms(
-  cordData: CordData,
-  existingRooms: RoomData[],
-) {
+const getRoomParams = (
+  cordOrg: Pick<OrgEntity, 'id'>,
+  location: Location,
+): Parameters<typeof liveblocks.createRoom>[1] => ({
+  defaultAccesses: [],
+  groupsAccesses: {
+    // allow users part of this group to write in the room
+    [`client_${cordOrg.id}`]: ['room:write'],
+    internal: ['room:write'],
+  },
+  metadata: Object.entries(location).reduce<CreateRoomParams['metadata']>(
+    (metadata, entry) => {
+      if (!metadata) {
+        metadata = {};
+      }
+
+      const [key, value] = entry;
+      metadata[key] = value.toString();
+
+      return metadata;
+    },
+    {},
+  ),
+});
+
+const createRoom = async (
+  roomId: string,
+  params: ReturnType<typeof getRoomParams>,
+) => {
+  try {
+    const newRoom = await liveblocks.createRoom(roomId, params);
+    if (!newRoom) {
+      throw new Error('Failed to create room');
+    }
+
+    const room = await toRoomWithThreads(newRoom);
+    logger.info(`Created new room ${room.id}`);
+    return room;
+  } catch (e) {
+    let message = 'Failed to create room';
+    let status = -1;
+    if (e instanceof LiveblocksError) {
+      status = e.status;
+      if (e.status === 409) {
+        // room already exists, should update
+        const updatedRoom = await liveblocks.updateRoom(roomId, params);
+        return await toRoomWithThreads(updatedRoom);
+      }
+      message = e.message;
+    } else if (e instanceof Error) {
+      message = e.message;
+    }
+
+    logger.error(`>>> ERROR: Error creating room ${roomId}`, {
+      status,
+      message: JSON.stringify(message),
+      groupAccesses: JSON.stringify(params.groupsAccesses),
+      metadata: JSON.stringify(params.metadata),
+    });
+
+    return null;
+  }
+};
+
+const updateRoom = async (
+  roomId: string,
+  params: ReturnType<typeof getRoomParams>,
+) => {
+  try {
+    const updatedRoom = await liveblocks.updateRoom(roomId, params);
+    const room = await toRoomWithThreads(updatedRoom);
+    logger.info(`Updated existing room ${room.id}`);
+    return room;
+  } catch (error) {
+    if (error instanceof LiveblocksError) {
+      logger.error('>>> ERROR: Failed to update room', {
+        roomId,
+        status: error.status,
+        message: error.message,
+      });
+    } else if (error instanceof Error) {
+      logger.error('>>> ERROR: Failed to update room', {
+        roomId,
+        message: error.message,
+      });
+    }
+    return null;
+  }
+};
+
+const getRoomsFromCordData = (cordData: CordData) => {
   const roomsMap = new Map<
     string,
     {
@@ -676,123 +755,70 @@ async function createOrUpdateRooms(
     }
 
     const room = roomsMap.get(roomId);
-    if (room) {
+    if (room && !room.threadIds.includes(threadId)) {
       room.threadIds.push(threadId);
     }
   });
 
-  const roomsToCreate = Array.from(roomsMap);
+  const rooms = Array.from(roomsMap);
+  logger.info(`Found ${rooms.length} rooms based on Cord threads locations`);
+
+  return rooms;
+};
+
+async function createOrUpdateRooms(
+  cordData: CordData,
+  existingRooms: RoomData[],
+) {
+  const roomsToCreate = getRoomsFromCordData(cordData);
 
   logger.info(`Pushing ${roomsToCreate.length} new rooms...`);
 
-  const rooms = await Promise.all(
+  const createdRooms: RoomWithThreads[] = [];
+  const updatedRooms: RoomWithThreads[] = [];
+
+  await Promise.all(
     roomsToCreate.map(async ([roomId, { location, threadIds }]) => {
       const threads =
         cordData.threads.filter((t) => threadIds.includes(t.id)) ?? [];
-      const [orgId] = threads.map((t) => t.orgID).filter(Boolean) ?? [];
+      const threadsOrgIds = threads.map((t) => t.orgID).filter(Boolean) ?? [];
+
+      if (threadsOrgIds.length > 1) {
+        logger.warn('>>> WARN: Multiple orgs found for threads', {
+          roomId,
+          threadIds,
+          threadsOrgIds,
+        });
+      }
+
+      const [orgId] = threadsOrgIds;
       const org = cordData.orgs.find((o) => o.id === orgId);
       if (!org?.externalID) {
         logger.error('Not externalID found', { roomId, threadIds, orgId });
-        return null;
+        return;
       }
 
-      const roomParams: Parameters<typeof liveblocks.createRoom>[1] = {
-        defaultAccesses: [],
-        groupsAccesses: {
-          // allow users part of this group to write in the room
-          [`client_${org.externalID}`]: ['room:write'],
-          internal: ['room:write'],
-        },
-        metadata: Object.entries(location).reduce<CreateRoomParams['metadata']>(
-          (metadata, entry) => {
-            if (!metadata) {
-              metadata = {};
-            }
-
-            const [key, value] = entry;
-            metadata[key] = value.toString();
-
-            return metadata;
-          },
-          {},
-        ),
-      };
+      const roomParams = getRoomParams(org, location);
 
       const existingRoom = existingRooms.find((r) => r.id === roomId);
       if (existingRoom) {
-        const updatedRoom = await liveblocks.updateRoom(
-          existingRoom.id,
-          roomParams,
-        );
-
-        const room = await toRoomWithThreads(updatedRoom);
-        logger.info(`Updated existing room ${room.id}`);
-        return room;
+        const updated = await updateRoom(existingRoom.id, roomParams);
+        if (updated) {
+          updatedRooms.push(updated);
+        }
       }
 
-      try {
-        const newRoom = await liveblocks.createRoom(roomId, roomParams);
-        if (!newRoom) {
-          throw new Error('Failed to create room');
-        }
-
-        const room = await toRoomWithThreads(newRoom);
-        logger.info(`Created new room ${room.id}`);
-        return room;
-      } catch (e) {
-        let message = 'Failed to create room';
-        if (e instanceof LiveblocksError) {
-          if (e.status === 409) {
-            // room already exists, should update
-            const updatedRoom = await liveblocks.updateRoom(
-              org.externalID,
-              roomParams,
-            );
-            return await toRoomWithThreads(updatedRoom);
-          }
-          message = e.message;
-        } else if (e instanceof Error) {
-          message = e.message;
-        }
-
-        logger.error('>>> ERROR: Error creating room', {
-          orgId: org.id,
-          externalId: org.externalID,
-          message,
-        });
-
-        return null;
+      const created = await createRoom(roomId, roomParams);
+      if (created) {
+        createdRooms.push(created);
       }
     }),
   );
 
-  const createdRooms = rooms.filter((r): r is RoomWithThreads => !!r);
+  logger.info(`${createdRooms.length} new rooms created`);
+  logger.info(`${updatedRooms.length} rooms updated`);
 
-  logger.info(`${createdRooms.length} Rooms pushed`, {
-    roomsIds: createdRooms.map((r) => r.id),
-  });
-
-  return createdRooms;
-}
-
-async function pushDataToLiveblocks(
-  cordData: CordData,
-  existingRooms: RoomWithThreads[],
-) {
-  // Add missing rooms to liveblocks
-  const newRooms = await createOrUpdateRooms(cordData, existingRooms);
-
-  const rooms = [...existingRooms, ...newRooms]
-    // .filter((room) =>
-    //   cordData.orgs.find((org) => org.externalID === room.metadata.clientId),
-    // )
-    .sort(
-      (a, b) =>
-        new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
-    );
-
-  // Process all rooms threaded comments to check and push any missing data
-  await Promise.all(rooms.map(processRoom(cordData)));
+  return [...createdRooms, ...updatedRooms];
 }
 
 async function getCordData() {
@@ -805,14 +831,6 @@ async function getCordData() {
   });
 
   const applicationIds = applications.map((app) => app.id);
-
-  /**
-   * TODO: remove this after final tests are done
-   */
-  // const orgExternalId =
-  //   environment === 'staging'
-  //     ? '01F5E6Q1GV7K62F74JAFH6K3V9' // Example Co
-  //     : '01F5E6Q1GV728ZN73AS4Y5EVW5'; // Abstractops
 
   const orgs = await OrgEntity.findAll({
     where: {
@@ -911,39 +929,58 @@ async function getCordData() {
   } satisfies CordData;
 }
 
+async function deleteExistingRooms(existingRooms: RoomData[]) {
+  logger.info(`Deleting ${existingRooms.length} existing rooms...`);
+  const deletedRoomsIds = (
+    await Promise.all(
+      existingRooms.map(async (room) => {
+        try {
+          await liveblocks.deleteRoom(room.id);
+          return room.id;
+        } catch (error) {
+          let status = -1;
+          let errorMessage = 'Unknown error';
+          if (error instanceof LiveblocksError) {
+            status = error.status;
+            errorMessage = error.message;
+          } else if (error instanceof Error) {
+            errorMessage = error.message;
+          }
+
+          logger.error(`>>> ERROR: Failed to delete room ${room.id}`, {
+            errorMessage,
+            status,
+          });
+
+          return null;
+        }
+      }),
+    )
+  ).filter(Boolean) as string[];
+
+  deletedRoomsIds.forEach((id) => {
+    const index = existingRooms.findIndex((r) => r.id === id);
+    if (index !== -1) {
+      existingRooms.splice(index, 1);
+    }
+  });
+
+  logger.info(`Deleted ${deletedRoomsIds.length} rooms`);
+}
+
 async function LiveblocksMigrationHandler(req: Request, res: Response) {
   try {
     logger.info(`Migrating ${environment} data to Liveblocks...`);
 
     const cordData = await getCordData();
 
-    // Get existing data from liveblocks
     const existingRooms = await getExistingLiveblocksData();
 
-    // TODO: remove delete rooms logic after final tests are done
-    // logger.info(`Deleting ${existingRooms.length} existing rooms...`);
-    // const deletedRoomsIds = await Promise.all(
-    //   existingRooms.map(async (room) => {
-    //     try {
-    //       await liveblocks.deleteRoom(room.id);
-    //       return room.id;
-    //     } catch (error) {
-    //       if (error instanceof LiveblocksError) {
-    //         logger.error(`>>> ERROR: Failed to delete room ${room.id}`, {
-    //           error: error.message,
-    //           status: error.status,
-    //         });
-    //       }
-    //       return null;
-    //     }
-    //   }),
-    // );
+    // await deleteExistingRooms(existingRooms);
 
-    // existingRooms = existingRooms.filter(
-    //   (room) => !deletedRoomsIds.includes(room.id),
-    // );
+    const rooms = await createOrUpdateRooms(cordData, existingRooms);
 
-    await pushDataToLiveblocks(cordData, existingRooms);
+    await Promise.all(rooms.map(processRoom(cordData)));
 
     logger.info('Migration completed');
 
