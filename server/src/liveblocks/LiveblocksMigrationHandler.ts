@@ -612,7 +612,7 @@ const processRoom = (cordData: CordData) => async (room: RoomWithThreads) => {
   return true;
 };
 
-async function getExistingLiveblocksData() {
+async function getLiveblocksData() {
   const rooms: RoomData[] = [];
 
   logger.info('Fetching existing rooms...');
@@ -972,9 +972,10 @@ async function LiveblocksMigrationHandler(req: Request, res: Response) {
   try {
     logger.info(`Migrating ${environment} data to Liveblocks...`);
 
-    const cordData = await getCordData();
-
-    const existingRooms = await getExistingLiveblocksData();
+    const [cordData, existingRooms] = await Promise.all([
+      getCordData(),
+      getLiveblocksData(),
+    ]);
 
     // await deleteExistingRooms(existingRooms);
 
