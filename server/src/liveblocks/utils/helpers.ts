@@ -1,8 +1,10 @@
 import type {
   CommentBodyBlockElement,
   CommentBodyInlineElement,
+  RoomData,
 } from '@liveblocks/node';
 import { v5 as uuid } from 'uuid';
+import winston from 'winston';
 import type { Location, MessageNode } from '@cord-sdk/types';
 import { MessageNodeType } from '@cord-sdk/types';
 import type { MessageEntity } from 'server/src/entity/message/MessageEntity.ts';
@@ -13,6 +15,7 @@ import type {
   CreateCommentData,
   ThreadCommentMetadata,
   ThreadCommentsMetadata,
+  ThreadEntityFull,
 } from 'server/src/liveblocks/utils/index.ts';
 import { anonymousLogger } from 'server/src/logging/Logger.ts';
 import { PageEntity } from 'server/src/entity/page/PageEntity.ts';
@@ -116,7 +119,12 @@ export const getExternalUserId = (
     user = cordData.users.find((u) => u.id === emailNotification?.userID);
   }
 
-  return user?.externalID ?? user?.id ?? cordUserId;
+  if (!user) {
+    logger.error(`>>> ERROR: User ${cordUserId} not found`);
+    return cordUserId;
+  }
+
+  return user.externalID ?? user.id;
 };
 
 export const toCreateCommentData = (
@@ -125,10 +133,6 @@ export const toCreateCommentData = (
 ): CreateCommentData | null => {
   const userId = getExternalUserId(cordData, message.sourceID);
   if (!userId) {
-    logger.error('>>> ERROR: User not found', {
-      messageId: message.id,
-      messageSourceId: message.sourceID,
-    });
     return null;
   }
 
@@ -211,9 +215,13 @@ export const parseThreadCommentsMetadata = (
 };
 
 export const getCordThreadLocation = async (
-  cordThread: ThreadEntity,
+  cordThread?: ThreadEntity,
 ): Promise<Location> => {
   let location: Location = {};
+  if (!cordThread) {
+    return location;
+  }
+
   try {
     const page = await PageEntity.findOne({
       where: {
@@ -239,13 +247,13 @@ export const getCordThreadLocation = async (
   return location;
 };
 
-export const getCordThreadMetadata = async (cordThread: ThreadEntity) => {
-  const location = await getCordThreadLocation(cordThread);
+export const toThreadMetadata = (cordThread: ThreadEntityFull) => {
+  const { id, orgID, createdTimestamp, location } = cordThread;
 
   const cordMetadata: CordThreadMetadata = {
-    cordThreadId: cordThread.id,
-    cordOrgId: cordThread.orgID,
-    cordCreatedTimestamp: cordThread.createdTimestamp.toISOString(),
+    cordThreadId: id,
+    cordOrgId: orgID,
+    cordCreatedTimestamp: createdTimestamp.toISOString(),
   };
 
   return {
@@ -258,11 +266,102 @@ export const getRoomId = (location: Location): string => {
   return uuid(JSON.stringify(location), ROOM_ID_NAMESPACE);
 };
 
-export async function toThreadData(t: ThreadEntity) {
-  const location = await getCordThreadLocation(t);
-  return {
-    threadId: t.id,
-    roomId: getRoomId(location),
-    location,
+export const isSameLocationThread =
+  (location: Location | RoomData['metadata']) =>
+  (thread: CordData['threads'][number]): boolean => {
+    if (!thread?.location) {
+      return false;
+    }
+    return Object.entries(location).every(
+      ([key, value]) => thread.location[key] === value,
+    );
   };
+
+const { combine, timestamp, json } = winston.format;
+
+const fileLogger = winston.createLogger({
+  format: combine(timestamp(), json()),
+  transports: [
+    new winston.transports.File({
+      filename: 'liveblocks-migration.log',
+    }),
+  ],
+});
+
+export const logFailedMessagePush = (
+  message: MessageEntity,
+  cordData: CordData,
+  roomId: string,
+  errorMessage?: string,
+) => {
+  const org = cordData.orgs.find((o) => o.id === message.orgID);
+  const userId = getExternalUserId(cordData, message.sourceID);
+  const thread = cordData.threads.find((t) => t.id === message.threadID);
+
+  fileLogger.error(errorMessage ?? 'Failed to push message to liveblocks', {
+    roomId: roomId,
+    clientId: org?.externalID,
+    userId: userId,
+    message: JSON.stringify(message.content),
+    location: JSON.stringify(thread?.location),
+  });
+};
+
+async function asyncForEach<T>(
+  array: T[],
+  callback: (item: T, index: number, array: T[]) => Promise<void>,
+) {
+  for (const item of array) {
+    await callback(item, array.indexOf(item), array);
+  }
+}
+
+function split<T>(arr: T[], n: number): T[][] {
+  const res = [];
+  while (arr.length) {
+    res.push(arr.splice(0, n));
+  }
+  return res;
+}
+const delayMS = (t = 200) => {
+  return new Promise((resolve) => {
+    setTimeout(() => {
+      resolve(t);
+    }, t);
+  });
+};
+
+/**
+ * Say you want to call 'parse' on 5 values, but run a maximum of 2 at a time, with 100ms delay between each batch.   Call like:
+ *
+ * throttlePromises(async (values) => await parse(values), ['1','2','3','4','5'], 2, 100)
+ */
+export function throttledPromises<T, R>(
+  asyncFunction: (item: T, index: number, array: T[]) => Promise<R>,
+  items: T[],
+  batchSize = 10,
+  delay = 50,
+): Promise<(Awaited<R> | void)[]> {
+  return new Promise((resolve, reject) => {
+    const output: (Awaited<R> | void)[] = [];
+    const batches = split(items, batchSize);
+    asyncForEach(batches, async (batch, batchNumber) => {
+      const promises = batch
+        .map((item, innerIndex) =>
+          asyncFunction(item, batchNumber * batchSize + innerIndex, items),
+        )
+        .map((p) => p.catch(reject));
+      const results = await Promise.all(promises);
+      output.push(...results);
+      if (delay) {
+        await delayMS(delay);
+      }
+    })
+      .then(() => {
+        resolve(output);
+      })
+      .catch((e) => {
+        reject(e);
+      });
+  });
 }

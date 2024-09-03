@@ -1,26 +1,10 @@
 import type { Liveblocks, RoomData, ThreadData } from '@liveblocks/node';
-import type { EmailOutboundNotificationEntity } from 'server/src/entity/email_notification/EmailOutboundNotificationEntity.ts';
-import type { MessageEntity } from 'server/src/entity/message/MessageEntity.ts';
-import type { NotificationEntity } from 'server/src/entity/notification/NotificationEntity.ts';
-import type { OrgEntity } from 'server/src/entity/org/OrgEntity.ts';
-import type { ThreadEntity } from 'server/src/entity/thread/ThreadEntity.ts';
-import type { UserEntity } from 'server/src/entity/user/UserEntity.ts';
-import type { ThreadMetadataKeys } from 'server/src/liveblocks/utils/index.ts';
 import type { Location } from 'common/types/index.ts';
+import type { MessageEntity } from 'server/src/entity/message/MessageEntity.ts';
+import type { ThreadMetadataKeys } from 'server/src/liveblocks/utils/index.ts';
+import type { getCordData } from 'server/src/liveblocks/LiveblocksMigrationHandler.ts';
 
-export type CordData = {
-  orgs: OrgEntity[];
-  users: UserEntity[];
-  threads: ThreadEntity[];
-  threadsLocations: {
-    threadId: string;
-    roomId: string;
-    location: Location;
-  }[];
-  messages: MessageEntity[];
-  emailNotifications: EmailOutboundNotificationEntity[];
-  notifications: NotificationEntity[];
-};
+export type CordData = Awaited<ReturnType<typeof getCordData>>;
 
 export type CreateCommentData = Parameters<
   Liveblocks['createComment']
@@ -54,4 +38,9 @@ export type ThreadCommentsMetadata = Array<ThreadCommentMetadata>;
 export type ThreadCommentMetadata = {
   cordMessageId: string;
   liveblocksCommentId: string;
+};
+
+export type ThreadEntityFull = CordData['threads'][number] & {
+  location: Location;
+  messages: MessageEntity[];
 };
