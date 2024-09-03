@@ -299,6 +299,7 @@ export const logFailedMessagePush = (
   const thread = cordData.threads.find((t) => t.id === message.threadID);
 
   fileLogger.error(errorMessage ?? 'Failed to push message to liveblocks', {
+    timestamp: new Date().toISOString(),
     roomId: roomId,
     clientId: org?.externalID,
     userId: userId,
@@ -339,8 +340,8 @@ const delayMS = (t = 200) => {
 export function throttledPromises<T, R>(
   asyncFunction: (item: T, index: number, array: T[]) => Promise<R>,
   items: T[],
-  batchSize = 10,
-  delay = 50,
+  batchSize = 20,
+  delay = 10,
 ): Promise<(Awaited<R> | void)[]> {
   return new Promise((resolve, reject) => {
     const output: (Awaited<R> | void)[] = [];

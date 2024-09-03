@@ -201,7 +201,12 @@ const createNewComment =
 
       const commentData = toCreateCommentData(message, cordData);
       if (!commentData) {
-        logFailedMessagePush(message, cordData, thread.roomId);
+        logFailedMessagePush(
+          message,
+          cordData,
+          thread.roomId,
+          'No comment data',
+        );
         return null;
       }
 
@@ -211,7 +216,11 @@ const createNewComment =
         data: commentData,
       });
     } catch (error) {
-      logFailedMessagePush(message, cordData, thread.roomId);
+      let errorMessage = 'Unknown error';
+      if (error instanceof Error) {
+        errorMessage = error.message;
+      }
+      logFailedMessagePush(message, cordData, thread.roomId, errorMessage);
     }
 
     if (!createdComment) {
@@ -304,7 +313,7 @@ const createNewThread =
     const [firstMessage, ...otherMessages] = messages;
     const threadComment = toCreateCommentData(firstMessage, cordData);
     if (!threadComment) {
-      logFailedMessagePush(firstMessage, cordData, room.id);
+      logFailedMessagePush(firstMessage, cordData, room.id, 'No comment data');
       return { cordThreadId: cordThread.id };
     }
 
@@ -340,17 +349,17 @@ const createNewThread =
             // }
           }
         } else {
-          logFailedMessagePush(firstMessage, cordData, room.id);
+          logFailedMessagePush(firstMessage, cordData, room.id, error.message);
         }
       } else if (error instanceof Error) {
-        logFailedMessagePush(firstMessage, cordData, room.id);
+        logFailedMessagePush(firstMessage, cordData, room.id, error.message);
       }
     }
 
     if (!thread) {
-      logger.error('>>> ERROR: No thread created', {
-        cordThreadId: cordThread.id,
-      });
+      logger.error(
+        `>>> ERROR: Cord thread ${cordThread.i} not created in room ${room.id}`,
+      );
       return { cordThreadId: cordThread.id };
     }
 
@@ -746,14 +755,21 @@ async function createOrUpdateRooms(
       return;
     }
 
-    const threadsOrgIds = threads.map((t) => t.orgID).filter(Boolean) ?? [];
+    const threadsOrgIds =
+      threads
+        .map((t, i, arr) => {
+          const index = arr.findIndex((t2) => t2.orgID === t.orgID);
+          if (i === index) {
+            return t.orgID;
+          }
+          return null;
+        })
+        .filter(Boolean) ?? [];
     if (threadsOrgIds.length > 1) {
       // TODO: figure out why this happens
-      logger.warn('>>> WARN: Multiple orgs found for threads', {
-        roomId,
-        threadIds,
-        threadsOrgIds,
-      });
+      logger.warn(
+        `>>> WARN: Multiple orgs found in room ${roomId} for threads ${threadIds.toString()}: ${threadsOrgIds.toString()}`,
+      );
     }
 
     const [orgId] = threadsOrgIds;
@@ -939,14 +955,7 @@ async function LiveblocksMigrationHandler(req: Request, res: Response) {
       getLiveblocksData(),
     ]);
 
-    // const deletedRoomsIds = await deleteExistingRooms(existingRooms);
-    // res
-    //   .json({
-    //     existingRoomsIds: existingRooms.map((r) => r.id),
-    //     deletedRoomsIds: deletedRoomsIds,
-    //   })
-    //   .status(200);
-    // return;
+    await deleteExistingRooms(existingRooms);
 
     const rooms = await createOrUpdateRooms(cordData, existingRooms);
 
