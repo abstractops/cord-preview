@@ -126,6 +126,8 @@ import ClientGetGroupMembersHandler from 'server/src/public/routes/platform/clie
 import ClientGetPresenceHandler from 'server/src/public/routes/platform/client/ClientGetPresenceHandler.ts';
 import GetDbDumpHandler from 'server/src/public/routes/platform/customer/GetDbDumpHandler.ts';
 import CopyFilesHandler from 'server/src/public/routes/platform/customer/CopyFilesHandler.ts';
+import LiveblocksMigrationHandler from 'server/src/liveblocks/LiveblocksMigrationHandler.ts';
+import { getServerAuthToken } from '@cord-sdk/server';
 
 export const ASANA_EVENTS_PATH = '/asana/events';
 export const LINEAR_EVENTS_PATH = '/linear/events';
@@ -697,5 +699,21 @@ MainRouter.get('/v1/cli-version', CliVersionHandler);
 
 // Stripe webhooks
 MainRouter.post('/stripe/webhook', StripeWebhookHandler);
+
+MainRouter.get('/jwt-token', (req, res) => {
+  const { project_id, project_secret } = req.body ?? {};
+  if (!project_id || !project_secret) {
+    res.status(400).json({ error: 'project_id and project_secret required' });
+    return;
+  }
+  const token = getServerAuthToken(project_id, project_secret);
+  res.status(200).json({ token });
+});
+
+MainRouter.post(
+  '/migrate-to-liveblocks',
+  // VerifyAppServerAuthToken,
+  LiveblocksMigrationHandler,
+);
 
 export default MainRouter;
